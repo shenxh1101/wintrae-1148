@@ -18,7 +18,10 @@ router.get('/search', (req: Request, res: Response) => {
   const offset = (Number(page) - 1) * Number(page_size);
 
   let query = `
-    SELECT DISTINCT l.*, c.code as city_code, c.name as city_name
+    SELECT DISTINCT l.id, l.city_id, l.line_no, l.name, l.type, l.direction,
+           l.start_station, l.end_station, l.first_bus, l.last_bus,
+           l.ticket_price, l.interval_minutes, l.status, l.color,
+           c.code as city_code, c.name as city_name
     FROM lines l
     JOIN cities c ON l.city_id = c.id
     WHERE l.status = 'active'
@@ -58,7 +61,7 @@ router.get('/search', (req: Request, res: Response) => {
 router.get('/:id', optionalUser, (req: Request, res: Response) => {
   const db = getDb();
   const { id } = req.params;
-  const { direction = 0 } = req.query;
+  const { direction } = req.query;
 
   const line = db.prepare(`
     SELECT l.*, c.code as city_code, c.name as city_name
@@ -70,13 +73,18 @@ router.get('/:id', optionalUser, (req: Request, res: Response) => {
     return notFound(res, '线路不存在');
   }
 
+  const effectiveDirection = direction !== undefined ? Number(direction) : Number(line.direction || 0);
+
   const stations = db.prepare(`
-    SELECT s.*, ls.sequence, ls.distance_from_start, ls.travel_seconds
+    SELECT s.*, ls.sequence, ls.distance_from_start, ls.travel_seconds,
+      CASE WHEN ls.sequence = 1 THEN '起点'
+           WHEN ls.sequence = (SELECT MAX(sequence) FROM line_stations WHERE line_id = ? AND direction = ?) THEN '终点'
+           ELSE '中途' END as station_type
     FROM line_stations ls
     JOIN stations s ON ls.station_id = s.id
     WHERE ls.line_id = ? AND ls.direction = ?
     ORDER BY ls.sequence
-  `).all(id, direction);
+  `).all(id, effectiveDirection, id, effectiveDirection);
 
   const diversions = db.prepare(`
     SELECT * FROM route_diversions
@@ -85,8 +93,17 @@ router.get('/:id', optionalUser, (req: Request, res: Response) => {
     ORDER BY created_at DESC
   `).all(id);
 
+  const stationList = stations as Array<{ travel_seconds?: number }>;
+  const totalDuration = stationList.reduce(
+    (acc, s) => acc + (Number(s.travel_seconds) || 0),
+    0,
+  );
+
   success(res, {
     ...line,
+    direction: effectiveDirection,
+    stations_count: stations.length,
+    total_duration_minutes: Math.ceil(totalDuration / 60),
     stations,
     active_diversions: diversions,
   });
@@ -95,19 +112,26 @@ router.get('/:id', optionalUser, (req: Request, res: Response) => {
 router.get('/:id/stations', (req: Request, res: Response) => {
   const db = getDb();
   const { id } = req.params;
-  const { direction = 0 } = req.query;
+  const { direction } = req.query;
+
+  const line = db.prepare('SELECT direction FROM lines WHERE id = ?').get(id) as { direction?: number } | undefined;
+  if (!line) {
+    return notFound(res, '线路不存在');
+  }
+
+  const effectiveDirection = direction !== undefined ? Number(direction) : Number(line.direction || 0);
 
   const stations = db.prepare(`
     SELECT s.id, s.name, s.address, s.latitude, s.longitude, s.is_transfer,
            ls.sequence, ls.distance_from_start, ls.travel_seconds,
-           CASE WHEN ls.distance_from_start = 0 THEN '起点'
+           CASE WHEN ls.sequence = 1 THEN '起点'
                 WHEN ls.sequence = (SELECT MAX(sequence) FROM line_stations WHERE line_id = ? AND direction = ?) THEN '终点'
                 ELSE '中途' END as station_type
     FROM line_stations ls
     JOIN stations s ON ls.station_id = s.id
     WHERE ls.line_id = ? AND ls.direction = ?
     ORDER BY ls.sequence
-  `).all(id, direction, id, direction);
+  `).all(id, effectiveDirection, id, effectiveDirection);
 
   success(res, stations);
 });
@@ -121,35 +145,57 @@ router.get('/:id/schedule', (req: Request, res: Response) => {
     return notFound(res, '线路不存在');
   }
 
-  const stationCount = db.prepare(
-    'SELECT COUNT(*) as cnt FROM line_stations WHERE line_id = ? AND direction = 0',
-  ).get(id) as { cnt: number };
+  const schedules: Array<{
+    direction: number;
+    first_bus: string;
+    last_bus: string;
+    interval: number;
+    stations_count: number;
+    total_duration_minutes?: number;
+    ticket_price: number;
+    start_station: string;
+    end_station: string;
+  }> = [];
 
-  const schedules: { direction: number; first_bus: string; last_bus: string; interval: number; stations_count: number }[] = [];
+  const thisDirection = Number(line.direction || 0);
+  const otherDirection = thisDirection === 0 ? 1 : 0;
 
-  for (let dir = 0; dir <= 1; dir++) {
+  for (const dir of [thisDirection, otherDirection]) {
     const stations = db.prepare(`
       SELECT sequence, travel_seconds FROM line_stations
       WHERE line_id = ? AND direction = ? ORDER BY sequence
     `).all(id, dir) as { sequence: number; travel_seconds: number }[];
 
+    if (stations.length === 0) continue;
+
     const totalSeconds = stations.reduce((acc, s) => acc + (s.travel_seconds || 0), 0);
     const totalMinutes = Math.ceil(totalSeconds / 60);
 
-    const dirInfo = dir === 0 ? line : (db.prepare('SELECT * FROM lines WHERE id = ?').get(id) as Record<string, unknown>);
+    const firstStation = db.prepare(`
+      SELECT s.name FROM line_stations ls JOIN stations s ON ls.station_id = s.id
+      WHERE ls.line_id = ? AND ls.direction = ? ORDER BY ls.sequence LIMIT 1
+    `).get(id, dir) as { name: string } | undefined;
+    const lastStation = db.prepare(`
+      SELECT s.name FROM line_stations ls JOIN stations s ON ls.station_id = s.id
+      WHERE ls.line_id = ? AND ls.direction = ? ORDER BY ls.sequence DESC LIMIT 1
+    `).get(id, dir) as { name: string } | undefined;
+
     schedules.push({
       direction: dir,
-      first_bus: String(dirInfo.first_bus || '06:00'),
-      last_bus: String(dirInfo.last_bus || '22:00'),
+      first_bus: String(line.first_bus || '06:00'),
+      last_bus: String(line.last_bus || '22:00'),
       interval: Number(line.interval_minutes || 10),
-      stations_count: stationCount.cnt,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ...(totalMinutes ? { total_duration_minutes: totalMinutes } as any : {}),
+      stations_count: stations.length,
+      total_duration_minutes: totalMinutes,
+      ticket_price: Number(line.ticket_price || 2),
+      start_station: firstStation?.name || '',
+      end_station: lastStation?.name || '',
     });
   }
 
   success(res, {
     line_id: id,
+    current_direction: thisDirection,
     ticket_price: line.ticket_price,
     schedules,
   });

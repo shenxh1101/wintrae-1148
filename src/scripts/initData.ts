@@ -82,8 +82,8 @@ function initSampleData(): void {
   logger.info(`已添加 ${baseStations.length} 个站点`);
 
   const insertLine = db.prepare(`
-    INSERT INTO lines (city_id, line_no, name, type, start_station, end_station, first_bus, last_bus, ticket_price, interval_minutes, color)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO lines (city_id, line_no, name, type, start_station, end_station, first_bus, last_bus, ticket_price, interval_minutes, color, direction)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const insertLineStation = db.prepare(`
@@ -123,6 +123,7 @@ function initSampleData(): void {
         tmpl.price,
         tmpl.interval,
         tmpl.color,
+        direction,
       );
       const lineId = r.lastInsertRowid as number;
 

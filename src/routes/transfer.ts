@@ -31,80 +31,132 @@ router.get('/plan', (req: Request, res: Response) => {
   }
 
   const fromLines = db.prepare(`
-    SELECT DISTINCT l.id, l.line_no, l.name, l.color, l.interval_minutes, l.ticket_price, ls.direction, ls.sequence
+    SELECT DISTINCT l.id, l.line_no, l.name, l.color, l.type, l.interval_minutes, l.ticket_price, ls.direction, ls.sequence
     FROM line_stations ls
     JOIN lines l ON ls.line_id = l.id
     WHERE ls.station_id = ? AND l.status = 'active'
   `).all(from_station_id);
 
   const toLines = db.prepare(`
-    SELECT DISTINCT l.id, l.line_no, l.name, l.color, ls.direction, ls.sequence
+    SELECT DISTINCT l.id, l.line_no, l.name, l.color, l.type, l.interval_minutes, l.ticket_price, ls.direction, ls.sequence
     FROM line_stations ls
     JOIN lines l ON ls.line_id = l.id
     WHERE ls.station_id = ? AND l.status = 'active'
   `).all(to_station_id);
 
-  const plans: Array<{
+  interface PlanSegment {
+    line_id: number;
+    line_no: string;
+    line_name: string;
+    line_type: string;
+    color: string;
+    from_station_id: number;
+    from_station_name: string;
+    to_station_id: number;
+    to_station_name: string;
+    direction: number;
+    stations_count: number;
+    travel_seconds: number;
+    wait_minutes: number;
+    duration_minutes: number;
+    ticket_price: number;
+    interval_minutes: number;
+  }
+
+  interface Plan {
     transfers: number;
     total_duration_minutes: number;
     total_stations: number;
     ticket_price: number;
-    segments: Array<{
-      line_id: number;
-      line_no: string;
-      line_name: string;
-      color: string;
-      from_station_id: number;
-      from_station_name: string;
-      to_station_id: number;
-      to_station_name: string;
-      direction: number;
-      stations_count: number;
-      duration_minutes: number;
-    }>;
+    transfer_wait_minutes?: number;
+    segments: PlanSegment[];
     walk_distance?: { transfer: number; from_start: number; to_end: number };
-  }> = [];
+  }
 
-  for (const fromLine of fromLines as Array<{ id: number; line_no: string; name: string; color: string; interval_minutes: number; ticket_price: number; direction: number; sequence: number }>) {
-    for (const toLine of toLines as Array<{ id: number; line_no: string; name: string; direction: number; sequence: number }>) {
+  const plans: Plan[] = [];
+
+  type LineInfo = {
+    id: number;
+    line_no: string;
+    name: string;
+    color: string;
+    type: string;
+    interval_minutes: number;
+    ticket_price: number;
+    direction: number;
+    sequence: number;
+  };
+
+  function calculateSegmentDuration(
+    lineId: number,
+    direction: number,
+    startSeq: number,
+    endSeq: number,
+    intervalMinutes: number,
+  ): { travel_seconds: number; wait_minutes: number; duration_minutes: number } {
+    const segments = db.prepare(`
+      SELECT travel_seconds FROM line_stations
+      WHERE line_id = ? AND direction = ? AND sequence > ? AND sequence <= ?
+      ORDER BY sequence
+    `).all(lineId, direction, startSeq, endSeq) as Array<{ travel_seconds: number }>;
+
+    const totalTravelSeconds = segments.reduce((acc, s) => acc + (s.travel_seconds || 90), 0);
+    const travelMinutes = Math.ceil(totalTravelSeconds / 60);
+    const waitMinutes = Math.ceil(intervalMinutes / 2);
+    return {
+      travel_seconds: totalTravelSeconds,
+      wait_minutes: waitMinutes,
+      duration_minutes: travelMinutes + waitMinutes,
+    };
+  }
+
+  for (const fromLine of fromLines as Array<LineInfo>) {
+    for (const toLine of toLines as Array<LineInfo>) {
       if (fromLine.id === toLine.id && fromLine.direction === toLine.direction) {
         if (fromLine.sequence < toLine.sequence) {
           const stationCount = toLine.sequence - fromLine.sequence;
-          const duration = stationCount * fromLine.interval_minutes;
+          const segInfo = calculateSegmentDuration(
+            fromLine.id, fromLine.direction, fromLine.sequence, toLine.sequence, fromLine.interval_minutes,
+          );
           plans.push({
             transfers: 0,
-            total_duration_minutes: duration,
+            total_duration_minutes: segInfo.duration_minutes,
             total_stations: stationCount,
             ticket_price: Number(fromLine.ticket_price),
             segments: [{
               line_id: fromLine.id,
               line_no: fromLine.line_no,
               line_name: fromLine.name,
+              line_type: fromLine.type,
               color: fromLine.color,
               from_station_id: Number(from_station_id),
-              from_station_name: fromStation.name as string,
+              from_station_name: String(fromStation.name),
               to_station_id: Number(to_station_id),
-              to_station_name: toStation.name as string,
+              to_station_name: String(toStation.name),
               direction: fromLine.direction,
               stations_count: stationCount,
-              duration_minutes: duration,
+              travel_seconds: segInfo.travel_seconds,
+              wait_minutes: segInfo.wait_minutes,
+              duration_minutes: segInfo.duration_minutes,
+              ticket_price: Number(fromLine.ticket_price),
+              interval_minutes: fromLine.interval_minutes,
             }],
           });
         }
       } else if (maxT >= 1) {
         const fromLineStations = db.prepare(`
-          SELECT s.id, s.name, ls.sequence
+          SELECT s.id, s.name, ls.sequence, ls.travel_seconds
           FROM line_stations ls JOIN stations s ON ls.station_id = s.id
           WHERE ls.line_id = ? AND ls.direction = ? AND ls.sequence >= ?
           ORDER BY ls.sequence
-        `).all(fromLine.id, fromLine.direction, fromLine.sequence) as Array<{ id: number; name: string; sequence: number }>;
+        `).all(fromLine.id, fromLine.direction, fromLine.sequence) as Array<{ id: number; name: string; sequence: number; travel_seconds: number }>;
 
         const toLineStations = db.prepare(`
-          SELECT s.id, s.name, ls.sequence
+          SELECT s.id, s.name, ls.sequence, ls.travel_seconds
           FROM line_stations ls JOIN stations s ON ls.station_id = s.id
           WHERE ls.line_id = ? AND ls.direction = ? AND ls.sequence <= ?
-          ORDER BY ls.sequence DESC
-        `).all(toLine.id, toLine.direction, toLine.sequence) as Array<{ id: number; name: string; sequence: number }>;
+          ORDER BY ls.sequence
+        `).all(toLine.id, toLine.direction, toLine.sequence) as Array<{ id: number; name: string; sequence: number; travel_seconds: number }>;
 
         for (const fs of fromLineStations) {
           for (const ts of toLineStations) {
@@ -112,38 +164,58 @@ router.get('/plan', (req: Request, res: Response) => {
               const seg1Count = fs.sequence - fromLine.sequence;
               const seg2Count = toLine.sequence - ts.sequence;
               if (seg1Count > 0 && seg2Count > 0) {
-                const duration = (seg1Count + seg2Count) * fromLine.interval_minutes + 5;
+                const seg1Info = calculateSegmentDuration(
+                  fromLine.id, fromLine.direction, fromLine.sequence, fs.sequence, fromLine.interval_minutes,
+                );
+                const seg2Info = calculateSegmentDuration(
+                  toLine.id, toLine.direction, ts.sequence, toLine.sequence, toLine.interval_minutes,
+                );
+                const transferWait = Math.max(3, Math.ceil(toLine.interval_minutes / 2));
+                const totalDuration = seg1Info.duration_minutes + transferWait + seg2Info.duration_minutes;
+                const totalPrice = Number(fromLine.ticket_price) + Number(toLine.ticket_price);
+
                 plans.push({
                   transfers: 1,
-                  total_duration_minutes: duration,
+                  total_duration_minutes: totalDuration,
                   total_stations: seg1Count + seg2Count,
-                  ticket_price: Number(fromLine.ticket_price) + Number(fromLine.ticket_price),
+                  ticket_price: totalPrice,
+                  transfer_wait_minutes: transferWait,
                   segments: [
                     {
                       line_id: fromLine.id,
                       line_no: fromLine.line_no,
                       line_name: fromLine.name,
+                      line_type: fromLine.type,
                       color: fromLine.color,
                       from_station_id: Number(from_station_id),
-                      from_station_name: fromStation.name as string,
+                      from_station_name: String(fromStation.name),
                       to_station_id: fs.id,
                       to_station_name: fs.name,
                       direction: fromLine.direction,
                       stations_count: seg1Count,
-                      duration_minutes: seg1Count * fromLine.interval_minutes,
+                      travel_seconds: seg1Info.travel_seconds,
+                      wait_minutes: seg1Info.wait_minutes,
+                      duration_minutes: seg1Info.duration_minutes,
+                      ticket_price: Number(fromLine.ticket_price),
+                      interval_minutes: fromLine.interval_minutes,
                     },
                     {
                       line_id: toLine.id,
                       line_no: toLine.line_no,
                       line_name: toLine.name,
-                      color: fromLine.color,
+                      line_type: toLine.type,
+                      color: toLine.color,
                       from_station_id: ts.id,
                       from_station_name: ts.name,
                       to_station_id: Number(to_station_id),
-                      to_station_name: toStation.name as string,
+                      to_station_name: String(toStation.name),
                       direction: toLine.direction,
                       stations_count: seg2Count,
-                      duration_minutes: seg2Count * fromLine.interval_minutes,
+                      travel_seconds: seg2Info.travel_seconds,
+                      wait_minutes: seg2Info.wait_minutes,
+                      duration_minutes: seg2Info.duration_minutes,
+                      ticket_price: Number(toLine.ticket_price),
+                      interval_minutes: toLine.interval_minutes,
                     },
                   ],
                 });

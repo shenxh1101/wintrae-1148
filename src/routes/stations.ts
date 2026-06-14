@@ -174,18 +174,16 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
       l.start_station,
       l.end_station,
       v.direction,
-      ls.sequence as target_station_seq,
       v.current_station_seq,
+      v.next_station_seq,
+      s_curr.name as current_station_name,
+      s_next.name as next_station_name,
+      ls.sequence as target_station_seq,
       (ls.sequence - v.current_station_seq) as stations_remaining,
       CASE
-        WHEN ls.sequence <= v.current_station_seq THEN 0
+        WHEN ls.sequence = v.next_station_seq THEN 60
         ELSE (ls.sequence - v.current_station_seq) * l.interval_minutes * 60
       END as eta_seconds,
-      CASE
-        WHEN ls.sequence <= v.current_station_seq THEN '即将到站'
-        WHEN (ls.sequence - v.current_station_seq) <= 2 THEN '即将到站'
-        ELSE CAST(((ls.sequence - v.current_station_seq) * l.interval_minutes) AS TEXT) || '分钟后'
-      END as eta_text,
       CASE
         WHEN v.capacity = 0 THEN 'unknown'
         WHEN v.current_passengers / v.capacity < 0.3 THEN 'empty'
@@ -196,14 +194,40 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
     FROM line_stations ls
     JOIN lines l ON ls.line_id = l.id
     JOIN vehicles v ON v.line_id = l.id AND v.direction = ls.direction
+    LEFT JOIN line_stations ls_curr ON ls_curr.line_id = v.line_id AND ls_curr.direction = v.direction AND ls_curr.sequence = v.current_station_seq
+    LEFT JOIN stations s_curr ON s_curr.id = ls_curr.station_id
+    LEFT JOIN line_stations ls_next ON ls_next.line_id = v.line_id AND ls_next.direction = v.direction AND ls_next.sequence = v.next_station_seq
+    LEFT JOIN stations s_next ON s_next.id = ls_next.station_id
     WHERE ls.station_id = ? AND v.status = 'running'
-      AND ls.sequence >= v.current_station_seq
+      AND ls.sequence > v.current_station_seq
     ORDER BY v.direction, eta_seconds ASC
-  `).all(id);
+  `).all(id) as Array<Record<string, unknown>>;
+
+  const arrivalsWithStatus = arrivals.map((item) => {
+    const etaSeconds = Number(item.eta_seconds);
+    const etaMinutes = Math.ceil(etaSeconds / 60);
+    const stationsRemaining = Number(item.stations_remaining);
+    let etaText = '';
+    let arrivalStatus = '';
+    if (stationsRemaining === 1) {
+      etaText = '即将到站';
+      arrivalStatus = '到站中';
+    } else if (etaMinutes <= 1) {
+      etaText = '1分钟内';
+      arrivalStatus = '即将到站';
+    } else if (etaMinutes <= 3) {
+      etaText = `${etaMinutes}分钟后`;
+      arrivalStatus = '临近到站';
+    } else {
+      etaText = `${etaMinutes}分钟后`;
+      arrivalStatus = '行驶中';
+    }
+    return { ...item, eta_text: etaText, arrival_status: arrivalStatus };
+  });
 
   success(res, {
     station_id: id,
-    arrivals,
+    arrivals: arrivalsWithStatus,
     refreshed_at: new Date().toISOString(),
   });
 });

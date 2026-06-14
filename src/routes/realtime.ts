@@ -72,10 +72,13 @@ router.get('/arrivals/station/:stationId', (req: Request, res: Response) => {
       l.end_station,
       v.direction,
       v.current_station_seq,
+      v.next_station_seq,
+      s_curr.name as current_station_name,
+      s_next.name as next_station_name,
       ls.sequence as target_sequence,
       (ls.sequence - v.current_station_seq) as stations_remaining,
       CASE
-        WHEN ls.sequence <= v.current_station_seq THEN 0
+        WHEN ls.sequence = v.next_station_seq THEN 1
         ELSE (ls.sequence - v.current_station_seq) * l.interval_minutes
       END as eta_minutes,
       CASE
@@ -91,7 +94,12 @@ router.get('/arrivals/station/:stationId', (req: Request, res: Response) => {
     FROM line_stations ls
     JOIN lines l ON ls.line_id = l.id
     JOIN vehicles v ON v.line_id = l.id AND v.direction = ls.direction
+    LEFT JOIN line_stations ls_curr ON ls_curr.line_id = v.line_id AND ls_curr.direction = v.direction AND ls_curr.sequence = v.current_station_seq
+    LEFT JOIN stations s_curr ON s_curr.id = ls_curr.station_id
+    LEFT JOIN line_stations ls_next ON ls_next.line_id = v.line_id AND ls_next.direction = v.direction AND ls_next.sequence = v.next_station_seq
+    LEFT JOIN stations s_next ON s_next.id = ls_next.station_id
     WHERE ls.station_id = ? AND v.status = 'running'
+      AND ls.sequence > v.current_station_seq
   `;
   const params: unknown[] = [stationId];
 
@@ -105,15 +113,23 @@ router.get('/arrivals/station/:stationId', (req: Request, res: Response) => {
   const rawArrivals = db.prepare(query).all(...params) as Array<Record<string, unknown>>;
   const arrivals = rawArrivals.map((item) => {
     const etaMinutes = Number(item.eta_minutes);
+    const stationsRemaining = Number(item.stations_remaining);
     let etaText = '';
-    if (etaMinutes <= 0 || Number(item.stations_remaining) <= 1) {
+    let status = '';
+    if (stationsRemaining === 1) {
       etaText = '即将到站';
-    } else if (etaMinutes < 1) {
+      status = '到站中';
+    } else if (etaMinutes <= 1) {
       etaText = '1分钟内';
+      status = '即将到站';
+    } else if (etaMinutes <= 3) {
+      etaText = `${Math.ceil(etaMinutes)}分钟后`;
+      status = '临近到站';
     } else {
       etaText = `${Math.ceil(etaMinutes)}分钟后`;
+      status = '行驶中';
     }
-    return { ...item, eta_text: etaText };
+    return { ...item, eta_text: etaText, arrival_status: status };
   });
 
   const stationInfo = station as Record<string, unknown>;
@@ -128,9 +144,9 @@ router.get('/arrivals/station/:stationId', (req: Request, res: Response) => {
 router.get('/arrivals/line/:lineId', (req: Request, res: Response) => {
   const db = getDb();
   const { lineId } = req.params;
-  const { station_id, direction = 0 } = req.query;
+  const { station_id, direction } = req.query;
 
-  const line = db.prepare('SELECT * FROM lines WHERE id = ?').get(lineId);
+  const line = db.prepare('SELECT * FROM lines WHERE id = ?').get(lineId) as Record<string, unknown> | undefined;
   if (!line) {
     return notFound(res, '线路不存在');
   }
@@ -139,26 +155,36 @@ router.get('/arrivals/line/:lineId', (req: Request, res: Response) => {
     return fail(res, '站点ID参数缺失');
   }
 
+  const effectiveDirection = direction !== undefined ? Number(direction) : Number(line.direction || 0);
+
   const vehicles = db.prepare(`
     SELECT 
-      v.*,
+      v.id, v.plate_no, v.current_station_seq, v.next_station_seq,
+      v.current_passengers, v.capacity, v.latitude, v.longitude,
       ls.sequence as target_sequence,
+      s_curr.name as current_station_name,
+      s_next.name as next_station_name,
       (ls.sequence - v.current_station_seq) as stations_remaining,
       CASE
-        WHEN ls.sequence <= v.current_station_seq THEN 0
+        WHEN ls.sequence = v.next_station_seq THEN 1
         ELSE (ls.sequence - v.current_station_seq) * l.interval_minutes
       END as eta_minutes
     FROM vehicles v
     JOIN line_stations ls ON ls.line_id = v.line_id AND ls.direction = v.direction AND ls.station_id = ?
     JOIN lines l ON l.id = v.line_id
+    LEFT JOIN line_stations ls_curr ON ls_curr.line_id = v.line_id AND ls_curr.direction = v.direction AND ls_curr.sequence = v.current_station_seq
+    LEFT JOIN stations s_curr ON s_curr.id = ls_curr.station_id
+    LEFT JOIN line_stations ls_next ON ls_next.line_id = v.line_id AND ls_next.direction = v.direction AND ls_next.sequence = v.next_station_seq
+    LEFT JOIN stations s_next ON s_next.id = ls_next.station_id
     WHERE v.line_id = ? AND v.direction = ? AND v.status = 'running'
-      AND ls.sequence >= v.current_station_seq
+      AND ls.sequence > v.current_station_seq
     ORDER BY eta_minutes ASC
     LIMIT 3
-  `).all(station_id, lineId, direction) as Array<Record<string, unknown>>;
+  `).all(station_id, lineId, effectiveDirection) as Array<Record<string, unknown>>;
 
   const result = vehicles.map((v) => {
     const etaMinutes = Number(v.eta_minutes);
+    const stationsRemaining = Number(v.stations_remaining);
     const crowdPct = v.capacity ? Math.round((Number(v.current_passengers) / Number(v.capacity)) * 100) : 0;
     let crowdLevel = 'unknown';
     if (crowdPct < 30) crowdLevel = 'empty';
@@ -166,12 +192,31 @@ router.get('/arrivals/line/:lineId', (req: Request, res: Response) => {
     else if (crowdPct < 85) crowdLevel = 'crowded';
     else crowdLevel = 'full';
 
+    let etaText = '';
+    let arrivalStatus = '';
+    if (stationsRemaining === 1) {
+      etaText = '即将到站';
+      arrivalStatus = '到站中';
+    } else if (etaMinutes <= 1) {
+      etaText = '1分钟内';
+      arrivalStatus = '即将到站';
+    } else if (etaMinutes <= 3) {
+      etaText = `${Math.ceil(etaMinutes)}分钟后`;
+      arrivalStatus = '临近到站';
+    } else {
+      etaText = `${Math.ceil(etaMinutes)}分钟后`;
+      arrivalStatus = '行驶中';
+    }
+
     return {
       vehicle_id: v.id,
       plate_no: v.plate_no,
-      stations_remaining: v.stations_remaining,
+      current_station_name: v.current_station_name,
+      next_station_name: v.next_station_name,
+      stations_remaining: stationsRemaining,
       eta_minutes: etaMinutes,
-      eta_text: etaMinutes <= 0 ? '即将到站' : `${Math.ceil(etaMinutes)}分钟后`,
+      eta_text: etaText,
+      arrival_status: arrivalStatus,
       crowd_level: crowdLevel,
       crowd_percentage: crowdPct,
       latitude: v.latitude,
@@ -182,9 +227,9 @@ router.get('/arrivals/line/:lineId', (req: Request, res: Response) => {
   success(res, {
     line_id: Number(lineId),
     station_id: Number(station_id),
-    direction: Number(direction),
+    direction: effectiveDirection,
     upcoming_vehicles: result,
-    interval_minutes: (line as { interval_minutes: number }).interval_minutes,
+    interval_minutes: Number(line.interval_minutes || 10),
     refreshed_at: new Date().toISOString(),
   });
 });
