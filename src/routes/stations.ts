@@ -9,39 +9,54 @@ const router = Router();
 router.get('/search', (req: Request, res: Response) => {
   const db = getDb();
   const { city_code, keyword, page = 1, page_size = 20 } = req.query;
-  const offset = (Number(page) - 1) * Number(page_size);
+  const pageNum = Math.max(1, Number(page));
+  const pageSize = Math.max(1, Math.min(100, Number(page_size)));
+  const offset = (pageNum - 1) * pageSize;
 
-  let query = `
-    SELECT DISTINCT s.*, c.code as city_code, c.name as city_name
-    FROM stations s
-    JOIN cities c ON s.city_id = c.id
-    WHERE 1=1
-  `;
+  const where: string[] = [];
   const params: unknown[] = [];
 
   if (city_code) {
-    query += ' AND c.code = ?';
+    where.push('c.code = ?');
     params.push(city_code);
   }
   if (keyword) {
-    query += ' AND (s.name LIKE ? OR s.address LIKE ?)';
+    where.push('(s.name LIKE ? OR s.address LIKE ?)');
     const kw = `%${keyword}%`;
     params.push(kw, kw);
   }
 
-  const countQuery = query.replace('SELECT DISTINCT s.*, c.code as city_code, c.name as city_name', 'SELECT COUNT(DISTINCT s.id) as total');
+  const whereStr = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+
+  const countQuery = `
+    SELECT COUNT(DISTINCT s.id) as total
+    FROM stations s JOIN cities c ON s.city_id = c.id
+    ${whereStr}
+  `;
   const totalRow = db.prepare(countQuery).get(...params) as { total: number };
+  const total = totalRow.total;
+  const totalPages = Math.ceil(total / pageSize);
 
-  query += ' ORDER BY s.name LIMIT ? OFFSET ?';
-  params.push(Number(page_size), offset);
-
-  const stations = db.prepare(query).all(...params);
+  const listQuery = `
+    SELECT DISTINCT s.id, s.city_id, s.name, s.address, s.latitude, s.longitude,
+           s.is_transfer, s.created_at, s.updated_at,
+           c.code as city_code, c.name as city_name
+    FROM stations s JOIN cities c ON s.city_id = c.id
+    ${whereStr}
+    ORDER BY s.name
+    LIMIT ? OFFSET ?
+  `;
+  const listParams = [...params, pageSize, offset];
+  const stations = db.prepare(listQuery).all(...listParams);
 
   success(res, {
     list: stations,
-    total: totalRow.total,
-    page: Number(page),
-    page_size: Number(page_size),
+    total,
+    page: pageNum,
+    page_size: pageSize,
+    total_pages: totalPages,
+    has_more: pageNum < totalPages,
+    has_prev: pageNum > 1,
   });
 });
 
@@ -154,13 +169,14 @@ router.get('/:id/lines', (req: Request, res: Response) => {
 router.get('/:id/arrivals', (req: Request, res: Response) => {
   const db = getDb();
   const { id } = req.params;
+  const { line_ids, group_by_line, limit } = req.query;
 
   const station = db.prepare('SELECT * FROM stations WHERE id = ?').get(id);
   if (!station) {
     return notFound(res, '站点不存在');
   }
 
-  const arrivals = db.prepare(`
+  let query = `
     SELECT 
       v.id as vehicle_id,
       v.plate_no,
@@ -170,6 +186,7 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
       l.id as line_id,
       l.line_no,
       l.name,
+      l.type,
       l.color,
       l.start_station,
       l.end_station,
@@ -190,7 +207,12 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
         WHEN v.current_passengers / v.capacity < 0.6 THEN 'comfortable'
         WHEN v.current_passengers / v.capacity < 0.85 THEN 'crowded'
         ELSE 'full'
-      END as crowd_level
+      END as crowd_level,
+      ROUND(CASE WHEN v.capacity > 0 THEN v.current_passengers * 100.0 / v.capacity ELSE 0 END, 1) as crowd_percentage,
+      v.latitude,
+      v.longitude,
+      l.interval_minutes,
+      l.ticket_price
     FROM line_stations ls
     JOIN lines l ON ls.line_id = l.id
     JOIN vehicles v ON v.line_id = l.id AND v.direction = ls.direction
@@ -200,10 +222,28 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
     LEFT JOIN stations s_next ON s_next.id = ls_next.station_id
     WHERE ls.station_id = ? AND v.status = 'running'
       AND ls.sequence > v.current_station_seq
-    ORDER BY v.direction, eta_seconds ASC
-  `).all(id) as Array<Record<string, unknown>>;
+  `;
+  const params: unknown[] = [id];
 
-  const arrivalsWithStatus = arrivals.map((item) => {
+  if (line_ids) {
+    const ids = String(line_ids).split(',').map(Number).filter(Boolean);
+    if (ids.length > 0) {
+      const placeholders = ids.map(() => '?').join(',');
+      query += ` AND l.id IN (${placeholders})`;
+      params.push(...ids);
+    }
+  }
+
+  query += ' ORDER BY eta_seconds ASC';
+
+  if (limit) {
+    query += ' LIMIT ?';
+    params.push(Number(limit));
+  }
+
+  const rawArrivals = db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+
+  const arrivals = rawArrivals.map((item) => {
     const etaSeconds = Number(item.eta_seconds);
     const etaMinutes = Math.ceil(etaSeconds / 60);
     const stationsRemaining = Number(item.stations_remaining);
@@ -222,14 +262,38 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
       etaText = `${etaMinutes}分钟后`;
       arrivalStatus = '行驶中';
     }
-    return { ...item, eta_text: etaText, arrival_status: arrivalStatus };
+    return { ...item, eta_text: etaText, arrival_status: arrivalStatus, eta_minutes: etaMinutes };
   });
 
-  success(res, {
+  const result: {
+    station_id: string | number;
+    station_name?: string;
+    arrivals: Array<Record<string, unknown>>;
+    by_line?: Record<string, Array<Record<string, unknown>>>;
+    refreshed_at: string;
+  } = {
     station_id: id,
-    arrivals: arrivalsWithStatus,
+    arrivals,
     refreshed_at: new Date().toISOString(),
-  });
+  };
+
+  if (station && typeof station === 'object' && 'name' in station) {
+    result.station_name = String(station.name);
+  }
+
+  if (group_by_line === 'true' || group_by_line === '1') {
+    const byLine: Record<string, Array<Record<string, unknown>>> = {};
+    for (const arr of arrivals as Array<Record<string, unknown>>) {
+      const key = String(arr.line_id);
+      if (!byLine[key]) {
+        byLine[key] = [];
+      }
+      byLine[key].push(arr);
+    }
+    result.by_line = byLine;
+  }
+
+  success(res, result);
 });
 
 export default router;

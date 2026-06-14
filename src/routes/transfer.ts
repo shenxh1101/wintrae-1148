@@ -45,6 +45,7 @@ router.get('/plan', (req: Request, res: Response) => {
   `).all(to_station_id);
 
   interface PlanSegment {
+    segment_index: number;
     line_id: number;
     line_no: string;
     line_name: string;
@@ -57,18 +58,36 @@ router.get('/plan', (req: Request, res: Response) => {
     direction: number;
     stations_count: number;
     travel_seconds: number;
+    travel_minutes: number;
     wait_minutes: number;
     duration_minutes: number;
     ticket_price: number;
     interval_minutes: number;
+    start_seq: number;
+    end_seq: number;
+    transfer_wait_minutes?: number;
+  }
+
+  interface PlanSummary {
+    total_stations: number;
+    total_travel_seconds: number;
+    total_travel_minutes: number;
+    total_wait_minutes: number;
+    total_transfer_wait_minutes: number;
+    total_duration_minutes: number;
+    total_ticket_price: number;
   }
 
   interface Plan {
     transfers: number;
-    total_duration_minutes: number;
     total_stations: number;
+    total_travel_seconds: number;
+    total_travel_minutes: number;
+    total_wait_minutes: number;
+    total_transfer_wait_minutes: number;
+    total_duration_minutes: number;
     ticket_price: number;
-    transfer_wait_minutes?: number;
+    summary: PlanSummary;
     segments: PlanSegment[];
     walk_distance?: { transfer: number; from_start: number; to_end: number };
   }
@@ -93,7 +112,7 @@ router.get('/plan', (req: Request, res: Response) => {
     startSeq: number,
     endSeq: number,
     intervalMinutes: number,
-  ): { travel_seconds: number; wait_minutes: number; duration_minutes: number } {
+  ): { travel_seconds: number; travel_minutes: number; wait_minutes: number; duration_minutes: number } {
     const segments = db.prepare(`
       SELECT travel_seconds FROM line_stations
       WHERE line_id = ? AND direction = ? AND sequence > ? AND sequence <= ?
@@ -105,8 +124,43 @@ router.get('/plan', (req: Request, res: Response) => {
     const waitMinutes = Math.ceil(intervalMinutes / 2);
     return {
       travel_seconds: totalTravelSeconds,
+      travel_minutes: travelMinutes,
       wait_minutes: waitMinutes,
       duration_minutes: travelMinutes + waitMinutes,
+    };
+  }
+
+  function buildPlan(
+    transfers: number,
+    segments: PlanSegment[],
+  ): Plan {
+    const totalStations = segments.reduce((acc, s) => acc + s.stations_count, 0);
+    const totalTravelSeconds = segments.reduce((acc, s) => acc + s.travel_seconds, 0);
+    const totalTravelMinutes = segments.reduce((acc, s) => acc + s.travel_minutes, 0);
+    const totalWaitMinutes = segments.reduce((acc, s) => acc + s.wait_minutes, 0);
+    const totalTransferWaitMinutes = segments.reduce((acc, s) => acc + (s.transfer_wait_minutes || 0), 0);
+    const totalPrice = segments.reduce((acc, s) => acc + s.ticket_price, 0);
+    const totalDuration = totalTravelMinutes + totalWaitMinutes;
+
+    return {
+      transfers,
+      total_stations: totalStations,
+      total_travel_seconds: totalTravelSeconds,
+      total_travel_minutes: totalTravelMinutes,
+      total_wait_minutes: totalWaitMinutes,
+      total_transfer_wait_minutes: totalTransferWaitMinutes,
+      total_duration_minutes: totalDuration,
+      ticket_price: totalPrice,
+      summary: {
+        total_stations: totalStations,
+        total_travel_seconds: totalTravelSeconds,
+        total_travel_minutes: totalTravelMinutes,
+        total_wait_minutes: totalWaitMinutes,
+        total_transfer_wait_minutes: totalTransferWaitMinutes,
+        total_duration_minutes: totalDuration,
+        total_ticket_price: totalPrice,
+      },
+      segments,
     };
   }
 
@@ -118,30 +172,29 @@ router.get('/plan', (req: Request, res: Response) => {
           const segInfo = calculateSegmentDuration(
             fromLine.id, fromLine.direction, fromLine.sequence, toLine.sequence, fromLine.interval_minutes,
           );
-          plans.push({
-            transfers: 0,
-            total_duration_minutes: segInfo.duration_minutes,
-            total_stations: stationCount,
+          const segment: PlanSegment = {
+            segment_index: 0,
+            line_id: fromLine.id,
+            line_no: fromLine.line_no,
+            line_name: fromLine.name,
+            line_type: fromLine.type,
+            color: fromLine.color,
+            from_station_id: Number(from_station_id),
+            from_station_name: String(fromStation.name),
+            to_station_id: Number(to_station_id),
+            to_station_name: String(toStation.name),
+            direction: fromLine.direction,
+            stations_count: stationCount,
+            travel_seconds: segInfo.travel_seconds,
+            travel_minutes: segInfo.travel_minutes,
+            wait_minutes: segInfo.wait_minutes,
+            duration_minutes: segInfo.duration_minutes,
             ticket_price: Number(fromLine.ticket_price),
-            segments: [{
-              line_id: fromLine.id,
-              line_no: fromLine.line_no,
-              line_name: fromLine.name,
-              line_type: fromLine.type,
-              color: fromLine.color,
-              from_station_id: Number(from_station_id),
-              from_station_name: String(fromStation.name),
-              to_station_id: Number(to_station_id),
-              to_station_name: String(toStation.name),
-              direction: fromLine.direction,
-              stations_count: stationCount,
-              travel_seconds: segInfo.travel_seconds,
-              wait_minutes: segInfo.wait_minutes,
-              duration_minutes: segInfo.duration_minutes,
-              ticket_price: Number(fromLine.ticket_price),
-              interval_minutes: fromLine.interval_minutes,
-            }],
-          });
+            interval_minutes: fromLine.interval_minutes,
+            start_seq: fromLine.sequence,
+            end_seq: toLine.sequence,
+          };
+          plans.push(buildPlan(0, [segment]));
         }
       } else if (maxT >= 1) {
         const fromLineStations = db.prepare(`
@@ -171,54 +224,58 @@ router.get('/plan', (req: Request, res: Response) => {
                   toLine.id, toLine.direction, ts.sequence, toLine.sequence, toLine.interval_minutes,
                 );
                 const transferWait = Math.max(3, Math.ceil(toLine.interval_minutes / 2));
-                const totalDuration = seg1Info.duration_minutes + transferWait + seg2Info.duration_minutes;
-                const totalPrice = Number(fromLine.ticket_price) + Number(toLine.ticket_price);
+                const seg2WaitMinutes = seg2Info.wait_minutes + transferWait;
+                const seg2DurationMinutes = seg2Info.travel_minutes + seg2WaitMinutes;
 
-                plans.push({
-                  transfers: 1,
-                  total_duration_minutes: totalDuration,
-                  total_stations: seg1Count + seg2Count,
-                  ticket_price: totalPrice,
-                  transfer_wait_minutes: transferWait,
-                  segments: [
-                    {
-                      line_id: fromLine.id,
-                      line_no: fromLine.line_no,
-                      line_name: fromLine.name,
-                      line_type: fromLine.type,
-                      color: fromLine.color,
-                      from_station_id: Number(from_station_id),
-                      from_station_name: String(fromStation.name),
-                      to_station_id: fs.id,
-                      to_station_name: fs.name,
-                      direction: fromLine.direction,
-                      stations_count: seg1Count,
-                      travel_seconds: seg1Info.travel_seconds,
-                      wait_minutes: seg1Info.wait_minutes,
-                      duration_minutes: seg1Info.duration_minutes,
-                      ticket_price: Number(fromLine.ticket_price),
-                      interval_minutes: fromLine.interval_minutes,
-                    },
-                    {
-                      line_id: toLine.id,
-                      line_no: toLine.line_no,
-                      line_name: toLine.name,
-                      line_type: toLine.type,
-                      color: toLine.color,
-                      from_station_id: ts.id,
-                      from_station_name: ts.name,
-                      to_station_id: Number(to_station_id),
-                      to_station_name: String(toStation.name),
-                      direction: toLine.direction,
-                      stations_count: seg2Count,
-                      travel_seconds: seg2Info.travel_seconds,
-                      wait_minutes: seg2Info.wait_minutes,
-                      duration_minutes: seg2Info.duration_minutes,
-                      ticket_price: Number(toLine.ticket_price),
-                      interval_minutes: toLine.interval_minutes,
-                    },
-                  ],
-                });
+                const segments: PlanSegment[] = [
+                  {
+                    segment_index: 0,
+                    line_id: fromLine.id,
+                    line_no: fromLine.line_no,
+                    line_name: fromLine.name,
+                    line_type: fromLine.type,
+                    color: fromLine.color,
+                    from_station_id: Number(from_station_id),
+                    from_station_name: String(fromStation.name),
+                    to_station_id: fs.id,
+                    to_station_name: fs.name,
+                    direction: fromLine.direction,
+                    stations_count: seg1Count,
+                    travel_seconds: seg1Info.travel_seconds,
+                    travel_minutes: seg1Info.travel_minutes,
+                    wait_minutes: seg1Info.wait_minutes,
+                    duration_minutes: seg1Info.duration_minutes,
+                    ticket_price: Number(fromLine.ticket_price),
+                    interval_minutes: fromLine.interval_minutes,
+                    start_seq: fromLine.sequence,
+                    end_seq: fs.sequence,
+                  },
+                  {
+                    segment_index: 1,
+                    line_id: toLine.id,
+                    line_no: toLine.line_no,
+                    line_name: toLine.name,
+                    line_type: toLine.type,
+                    color: toLine.color,
+                    from_station_id: ts.id,
+                    from_station_name: ts.name,
+                    to_station_id: Number(to_station_id),
+                    to_station_name: String(toStation.name),
+                    direction: toLine.direction,
+                    stations_count: seg2Count,
+                    travel_seconds: seg2Info.travel_seconds,
+                    travel_minutes: seg2Info.travel_minutes,
+                    wait_minutes: seg2WaitMinutes,
+                    duration_minutes: seg2DurationMinutes,
+                    ticket_price: Number(toLine.ticket_price),
+                    interval_minutes: toLine.interval_minutes,
+                    start_seq: ts.sequence,
+                    end_seq: toLine.sequence,
+                    transfer_wait_minutes: transferWait,
+                  },
+                ];
+
+                plans.push(buildPlan(1, segments));
               }
               break;
             }

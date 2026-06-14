@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { getDb } from '../db';
-import { success, notFound } from '../utils/response';
+import { success, notFound, fail } from '../utils/response';
 import { optionalUser } from '../middleware/auth';
 import { haversineDistance, formatDistance } from '../utils/geo';
 
@@ -12,49 +12,124 @@ router.get('/cities', (_req: Request, res: Response) => {
   success(res, cities);
 });
 
+router.post('/batch', (req: Request, res: Response) => {
+  const db = getDb();
+  const { ids } = req.body;
+
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return fail(res, '线路ID数组为必填');
+  }
+
+  if (ids.length > 50) {
+    return fail(res, '批量查询最多支持50条线路');
+  }
+
+  const placeholders = ids.map(() => '?').join(',');
+  const lines = db.prepare(`
+    SELECT 
+      l.id, l.line_no, l.name, l.type, l.direction, l.status,
+      l.start_station, l.end_station, l.first_bus, l.last_bus,
+      l.ticket_price, l.interval_minutes, l.color,
+      c.code as city_code, c.name as city_name
+    FROM lines l
+    JOIN cities c ON l.city_id = c.id
+    WHERE l.id IN (${placeholders})
+    ORDER BY l.line_no
+  `).all(...ids) as Array<Record<string, unknown>>;
+
+  const lineIds = lines.map((l) => l.id);
+  const stationCounts: Record<number, number> = {};
+
+  if (lineIds.length > 0) {
+    const countPlaceholders = lineIds.map(() => '?').join(',');
+    const counts = db.prepare(`
+      SELECT line_id, direction, COUNT(*) as cnt
+      FROM line_stations
+      WHERE line_id IN (${countPlaceholders})
+      GROUP BY line_id, direction
+    `).all(...lineIds) as Array<{ line_id: number; direction: number; cnt: number }>;
+
+    for (const row of counts) {
+      stationCounts[row.line_id] = row.cnt;
+    }
+  }
+
+  const result = lines.map((line) => {
+    const lineId = Number(line.id);
+    const stationsCount = stationCounts[lineId] || 0;
+    return {
+      ...line,
+      stations_count: stationsCount,
+      is_active: line.status === 'active',
+    };
+  });
+
+  const notFoundIds = ids.filter((id: unknown) => !lineIds.includes(Number(id)));
+
+  success(res, {
+    lines: result,
+    requested_count: ids.length,
+    returned_count: result.length,
+    not_found_ids: notFoundIds,
+  });
+});
+
 router.get('/search', (req: Request, res: Response) => {
   const db = getDb();
   const { city_code, keyword, type, page = 1, page_size = 20 } = req.query;
-  const offset = (Number(page) - 1) * Number(page_size);
+  const pageNum = Math.max(1, Number(page));
+  const pageSize = Math.max(1, Math.min(100, Number(page_size)));
+  const offset = (pageNum - 1) * pageSize;
 
-  let query = `
-    SELECT DISTINCT l.id, l.city_id, l.line_no, l.name, l.type, l.direction,
-           l.start_station, l.end_station, l.first_bus, l.last_bus,
-           l.ticket_price, l.interval_minutes, l.status, l.color,
-           c.code as city_code, c.name as city_name
-    FROM lines l
-    JOIN cities c ON l.city_id = c.id
-    WHERE l.status = 'active'
-  `;
+  const where: string[] = ["l.status = 'active'"];
   const params: unknown[] = [];
 
   if (city_code) {
-    query += ' AND c.code = ?';
+    where.push('c.code = ?');
     params.push(city_code);
   }
   if (keyword) {
-    query += ' AND (l.line_no LIKE ? OR l.name LIKE ? OR l.start_station LIKE ? OR l.end_station LIKE ?)';
+    where.push('(l.line_no LIKE ? OR l.name LIKE ? OR l.start_station LIKE ? OR l.end_station LIKE ?)');
     const kw = `%${keyword}%`;
     params.push(kw, kw, kw, kw);
   }
   if (type && type !== 'all') {
-    query += ' AND l.type = ?';
+    where.push('l.type = ?');
     params.push(type);
   }
 
-  const countQuery = query.replace('SELECT DISTINCT l.*, c.code as city_code, c.name as city_name', 'SELECT COUNT(DISTINCT l.id) as total');
+  const whereStr = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+
+  const countQuery = `
+    SELECT COUNT(DISTINCT l.id) as total
+    FROM lines l JOIN cities c ON l.city_id = c.id
+    ${whereStr}
+  `;
   const totalRow = db.prepare(countQuery).get(...params) as { total: number };
+  const total = totalRow.total;
+  const totalPages = Math.ceil(total / pageSize);
 
-  query += ' ORDER BY l.line_no LIMIT ? OFFSET ?';
-  params.push(Number(page_size), offset);
-
-  const lines = db.prepare(query).all(...params);
+  const listQuery = `
+    SELECT DISTINCT l.id, l.city_id, l.line_no, l.name, l.type, l.direction,
+           l.start_station, l.end_station, l.first_bus, l.last_bus,
+           l.ticket_price, l.interval_minutes, l.status, l.color,
+           c.code as city_code, c.name as city_name
+    FROM lines l JOIN cities c ON l.city_id = c.id
+    ${whereStr}
+    ORDER BY l.line_no
+    LIMIT ? OFFSET ?
+  `;
+  const listParams = [...params, pageSize, offset];
+  const lines = db.prepare(listQuery).all(...listParams);
 
   success(res, {
     list: lines,
-    total: totalRow.total,
-    page: Number(page),
-    page_size: Number(page_size),
+    total,
+    page: pageNum,
+    page_size: pageSize,
+    total_pages: totalPages,
+    has_more: pageNum < totalPages,
+    has_prev: pageNum > 1,
   });
 });
 
