@@ -77,9 +77,8 @@ router.post('/batch', (req: Request, res: Response) => {
 router.get('/search', (req: Request, res: Response) => {
   const db = getDb();
   const { city_code, keyword, type, page = 1, page_size = 20 } = req.query;
-  const pageNum = Math.max(1, Number(page));
+  let pageNum = Math.max(1, Number(page));
   const pageSize = Math.max(1, Math.min(100, Number(page_size)));
-  const offset = (pageNum - 1) * pageSize;
 
   const where: string[] = ["l.status = 'active'"];
   const params: unknown[] = [];
@@ -107,7 +106,13 @@ router.get('/search', (req: Request, res: Response) => {
   `;
   const totalRow = db.prepare(countQuery).get(...params) as { total: number };
   const total = totalRow.total;
-  const totalPages = Math.ceil(total / pageSize);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  if (pageNum > totalPages) {
+    pageNum = totalPages;
+  }
+
+  const offset = (pageNum - 1) * pageSize;
 
   const listQuery = `
     SELECT DISTINCT l.id, l.city_id, l.line_no, l.name, l.type, l.direction,
@@ -130,6 +135,7 @@ router.get('/search', (req: Request, res: Response) => {
     total_pages: totalPages,
     has_more: pageNum < totalPages,
     has_prev: pageNum > 1,
+    page_adjusted: pageNum !== Number(page),
   });
 });
 

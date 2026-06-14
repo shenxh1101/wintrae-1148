@@ -9,9 +9,8 @@ const router = Router();
 router.get('/search', (req: Request, res: Response) => {
   const db = getDb();
   const { city_code, keyword, page = 1, page_size = 20 } = req.query;
-  const pageNum = Math.max(1, Number(page));
+  let pageNum = Math.max(1, Number(page));
   const pageSize = Math.max(1, Math.min(100, Number(page_size)));
-  const offset = (pageNum - 1) * pageSize;
 
   const where: string[] = [];
   const params: unknown[] = [];
@@ -35,7 +34,13 @@ router.get('/search', (req: Request, res: Response) => {
   `;
   const totalRow = db.prepare(countQuery).get(...params) as { total: number };
   const total = totalRow.total;
-  const totalPages = Math.ceil(total / pageSize);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  if (pageNum > totalPages) {
+    pageNum = totalPages;
+  }
+
+  const offset = (pageNum - 1) * pageSize;
 
   const listQuery = `
     SELECT DISTINCT s.id, s.city_id, s.name, s.address, s.latitude, s.longitude,
@@ -57,6 +62,7 @@ router.get('/search', (req: Request, res: Response) => {
     total_pages: totalPages,
     has_more: pageNum < totalPages,
     has_prev: pageNum > 1,
+    page_adjusted: pageNum !== Number(page),
   });
 });
 
@@ -169,7 +175,7 @@ router.get('/:id/lines', (req: Request, res: Response) => {
 router.get('/:id/arrivals', (req: Request, res: Response) => {
   const db = getDb();
   const { id } = req.params;
-  const { line_ids, group_by_line, limit } = req.query;
+  const { line_ids, group_by_line, limit, top_per_line, per_line_limit } = req.query;
 
   const station = db.prepare('SELECT * FROM stations WHERE id = ?').get(id);
   if (!station) {
@@ -236,12 +242,26 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
 
   query += ' ORDER BY eta_seconds ASC';
 
-  if (limit) {
+  if (limit && !(top_per_line === 'true' || top_per_line === '1')) {
     query += ' LIMIT ?';
     params.push(Number(limit));
   }
 
-  const rawArrivals = db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+  let rawArrivals = db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+
+  if (top_per_line === 'true' || top_per_line === '1') {
+    const perLine = Number(per_line_limit) || 1;
+    const seen: Record<string, number> = {};
+    const filtered: Array<Record<string, unknown>> = [];
+    for (const arr of rawArrivals) {
+      const key = String(arr.line_id) + '_' + String(arr.direction);
+      seen[key] = (seen[key] || 0) + 1;
+      if (seen[key] <= perLine) {
+        filtered.push(arr);
+      }
+    }
+    rawArrivals = filtered;
+  }
 
   const arrivals = rawArrivals.map((item) => {
     const etaSeconds = Number(item.eta_seconds);
@@ -270,6 +290,7 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
     station_name?: string;
     arrivals: Array<Record<string, unknown>>;
     by_line?: Record<string, Array<Record<string, unknown>>>;
+    top_by_line?: Record<string, Record<string, unknown>>;
     refreshed_at: string;
   } = {
     station_id: id,
@@ -283,14 +304,17 @@ router.get('/:id/arrivals', (req: Request, res: Response) => {
 
   if (group_by_line === 'true' || group_by_line === '1') {
     const byLine: Record<string, Array<Record<string, unknown>>> = {};
+    const topByLine: Record<string, Record<string, unknown>> = {};
     for (const arr of arrivals as Array<Record<string, unknown>>) {
       const key = String(arr.line_id);
       if (!byLine[key]) {
         byLine[key] = [];
+        topByLine[key] = arr;
       }
       byLine[key].push(arr);
     }
     result.by_line = byLine;
+    result.top_by_line = topByLine;
   }
 
   success(res, result);

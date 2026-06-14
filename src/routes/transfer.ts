@@ -290,11 +290,77 @@ router.get('/plan', (req: Request, res: Response) => {
     return a.total_duration_minutes - b.total_duration_minutes;
   });
 
+  const recommendByStrategy = (allPlans: Plan[]) => {
+    const strategies: {
+      key: string;
+      label: string;
+      description: string;
+      sort: (a: Plan, b: Plan) => number;
+    }[] = [
+      {
+        key: 'fewer_transfers',
+        label: '少换乘',
+        description: '优先选择换乘次数少的方案',
+        sort: (a, b) => {
+          if (a.transfers !== b.transfers) return a.transfers - b.transfers;
+          return a.total_duration_minutes - b.total_duration_minutes;
+        },
+      },
+      {
+        key: 'lowest_cost',
+        label: '少花钱',
+        description: '优先选择票价最便宜的方案',
+        sort: (a, b) => {
+          if (a.ticket_price !== b.ticket_price) return a.ticket_price - b.ticket_price;
+          if (a.transfers !== b.transfers) return a.transfers - b.transfers;
+          return a.total_duration_minutes - b.total_duration_minutes;
+        },
+      },
+      {
+        key: 'fastest',
+        label: '最快到达',
+        description: '优先选择总耗时最短的方案',
+        sort: (a, b) => {
+          if (a.total_duration_minutes !== b.total_duration_minutes) return a.total_duration_minutes - b.total_duration_minutes;
+          if (a.transfers !== b.transfers) return a.transfers - b.transfers;
+          return a.ticket_price - b.ticket_price;
+        },
+      },
+    ];
+
+    const results: Array<{
+      key: string;
+      label: string;
+      description: string;
+      recommended: Plan | null;
+      alternatives: Plan[];
+    }> = [];
+
+    for (const strategy of strategies) {
+      const sorted = [...allPlans].sort(strategy.sort);
+      results.push({
+        key: strategy.key,
+        label: strategy.label,
+        description: strategy.description,
+        recommended: sorted[0] || null,
+        alternatives: sorted.slice(1, 3),
+      });
+    }
+
+    return results;
+  };
+
+  const recommendations = recommendByStrategy(plans);
+  const defaultStrategy = recommendations.find(r => r.key === 'fewer_transfers');
+
   success(res, {
     from_station: { id: Number(from_station_id), name: fromStation.name as string },
     to_station: { id: Number(to_station_id), name: toStation.name as string },
     plans: plans.slice(0, 10),
     total_found: Math.min(plans.length, 10),
+    recommendations,
+    default_recommended: defaultStrategy?.recommended || null,
+    strategies: ['fewer_transfers', 'lowest_cost', 'fastest'],
   });
 });
 
